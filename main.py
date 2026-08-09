@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Cookie Service — Render.com (Docker)
-Uses system Chromium + Playwright with robust fallbacks.
+Uses system Chromium + Playwright.
 """
 
 import os
@@ -45,9 +45,8 @@ def is_authorized():
     secret = request.headers.get("X-Render-Secret", "")
     return secret == RENDER_SECRET and RENDER_SECRET != ""
 
-# ── Core extraction with multiple strategies ─────────────────────────
+# ── Core extraction with retries ─────────────────────────────────────
 def extract_cookies():
-    """Extract cookies – tries multiple approaches with retries."""
     last_exception = None
     for attempt in range(1, RETRY_COUNT + 1):
         logger.info(f"Extraction attempt {attempt}/{RETRY_COUNT}")
@@ -56,11 +55,10 @@ def extract_cookies():
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed: {e}")
             last_exception = e
-            time.sleep(5 * attempt)  # backoff
+            time.sleep(5 * attempt)
     raise Exception(f"All {RETRY_COUNT} attempts failed. Last error: {last_exception}")
 
 def _extract_cookies_internal():
-    """Internal extraction – one attempt."""
     with sync_playwright() as p:
         logger.info("Launching Chromium...")
         browser = p.chromium.launch(
@@ -85,57 +83,47 @@ def _extract_cookies_internal():
         )
         page = context.new_page()
 
-        # Save debug artifacts on failure
-        def save_debug_info():
+        def save_debug_info(name="debug"):
             try:
-                page.screenshot(path="/tmp/debug_latest.png")
-                with open("/tmp/debug_latest.html", "w") as f:
+                page.screenshot(path=f"/tmp/{name}.png")
+                with open(f"/tmp/{name}.html", "w") as f:
                     f.write(page.content())
-                logger.info("Saved debug screenshot and HTML to /tmp/")
+                logger.info(f"Saved debug files: /tmp/{name}.*")
             except:
                 pass
 
         try:
-            # ── Strategy: Start from YouTube, click "Sign in" ──
+            # ── Navigate to YouTube, try Sign In ──
             logger.info("Navigating to YouTube...")
             page.goto("https://www.youtube.com", wait_until="networkidle", timeout=30000)
-            # Wait for the sign-in button (could be text or a[href])
             sign_in_clicked = False
             for selector in ['text="Sign in"', 'a[href*="accounts.google.com"]', 'ytd-button-renderer:has-text("Sign in")']:
                 try:
                     page.wait_for_selector(selector, state="visible", timeout=5000)
                     page.click(selector)
                     sign_in_clicked = True
-                    logger.info(f"Clicked sign-in using selector: {selector}")
+                    logger.info(f"Clicked sign-in using: {selector}")
                     break
                 except:
                     continue
             if not sign_in_clicked:
-                # Fallback: go directly to accounts.google.com
                 logger.info("Sign-in button not found; going directly to accounts.google.com")
                 page.goto("https://accounts.google.com/", wait_until="networkidle", timeout=30000)
 
-            # ── Wait for either email field or "Choose an account" ──
-            # Check for "Choose an account" screen
+            # ── Handle "Choose an account" screen ──
             try:
-                choose_account = page.wait_for_selector('div[data-challengetype]', timeout=3000)  # not reliable
-                # better: check for text
                 if page.locator('text="Choose an account"').is_visible():
                     logger.info("Detected 'Choose an account' screen.")
-                    # Click "Use another account" or the "Add account" button
                     try:
                         page.click('text="Use another account"')
                     except:
                         page.click('text="Add account"')
-                    # Wait for email field to appear
                     page.wait_for_selector('#identifierId', state="visible", timeout=10000)
             except:
-                # No choose account; proceed with email field
                 pass
 
             # ── Enter email ──
             logger.info("Entering email...")
-            # Try multiple selectors for email input
             email_selectors = ['#identifierId', 'input[type="email"]', 'input[name="identifier"]']
             email_filled = False
             for sel in email_selectors:
@@ -143,33 +131,57 @@ def _extract_cookies_internal():
                     page.wait_for_selector(sel, state="visible", timeout=5000)
                     page.fill(sel, GOOGLE_EMAIL)
                     email_filled = True
-                    logger.info(f"Filled email using selector: {sel}")
+                    logger.info(f"Filled email using: {sel}")
                     break
                 except:
                     continue
             if not email_filled:
-                save_debug_info()
+                save_debug_info("email_fail")
                 raise Exception("Could not find email input field.")
 
+            # Click Next (email)
             page.click('#identifierNext')
-            # Wait for password field
-            page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
 
-            # ── Enter password ──
-            logger.info("Entering password...")
-            page.fill('input[type="password"]', GOOGLE_PASS)
-            page.click('#passwordNext')
+            # ── Wait for visible password field ──
+            logger.info("Waiting for password field...")
+            # Google often shows a dummy hidden password field; we must find the visible one.
+            password_selectors = [
+                'input[type="password"]:visible',
+                'input[name="password"]:visible',
+                '#password:visible',
+                'input[type="password"][aria-label*="password" i]',
+                'input[type="password"]:not([class*="Hvu6D"])'
+            ]
+            password_found = False
+            for sel in password_selectors:
+                try:
+                    page.wait_for_selector(sel, state="visible", timeout=5000)
+                    page.fill(sel, GOOGLE_PASS)
+                    password_found = True
+                    logger.info(f"Filled password using: {sel}")
+                    break
+                except Exception as e:
+                    logger.debug(f"Selector {sel} failed: {e}")
+                    continue
+            if not password_found:
+                save_debug_info("password_fail")
+                raise Exception("Could not locate a visible password field.")
+
+            # Click password Next (or press Enter)
+            try:
+                page.click('#passwordNext')
+            except:
+                page.keyboard.press('Enter')
 
             # ── Wait for successful login ──
             logger.info("Waiting for login to complete...")
             try:
                 page.wait_for_url(lambda url: "youtube.com" in url or "myaccount.google.com" in url, timeout=15000)
             except PlaywrightTimeout:
-                # Maybe a CAPTCHA or 2FA page appears
-                save_debug_info()
+                save_debug_info("login_timeout")
                 raise Exception("Login did not navigate to expected URL – possible CAPTCHA or 2FA.")
 
-            # ── Ensure we're on YouTube ──
+            # ── Ensure YouTube is loaded ──
             if "youtube.com" not in page.url:
                 logger.info("Navigating to YouTube...")
                 page.goto("https://www.youtube.com", wait_until="networkidle", timeout=30000)
@@ -201,14 +213,13 @@ def _extract_cookies_internal():
             return cookie_text
 
         except Exception as e:
-            save_debug_info()
+            save_debug_info("exception")
             raise e
         finally:
             browser.close()
 
-# ── Cache wrapper (thread-safe) ──────────────────────────────────────
+# ── Cache wrapper ──────────────────────────────────────────────────────
 def get_cookies():
-    """Return (cookie_text, is_fresh)."""
     with _cache_lock:
         if _cache["cookie_text"] and _cache["extracted_at"]:
             age = datetime.now() - _cache["extracted_at"]
@@ -289,7 +300,7 @@ def force_refresh():
         return jsonify({"error": "Unauthorized"}), 401
 
     with _cache_lock:
-        _cache["extracted_at"] = None  # invalidate
+        _cache["extracted_at"] = None
 
     def _do_refresh():
         try:
@@ -301,6 +312,32 @@ def force_refresh():
 
     threading.Thread(target=_do_refresh, daemon=True).start()
     return jsonify({"message": "Refresh started – check / for status"}), 200
+
+# ── Manual update endpoint (optional) ────────────────────────────────
+@app.route("/manual-update", methods=["POST"])
+def manual_update():
+    """Manually set cookies from base64-encoded Netscape cookie file."""
+    if not is_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    if not data or "cookies_b64" not in data:
+        return jsonify({"error": "Missing 'cookies_b64' field"}), 400
+
+    try:
+        cookie_text = base64.b64decode(data["cookies_b64"]).decode("utf-8")
+        if not cookie_text.startswith("# Netscape HTTP Cookie File"):
+            return jsonify({"error": "Invalid cookie format"}), 400
+
+        with _cache_lock:
+            _cache["cookie_text"] = cookie_text
+            _cache["extracted_at"] = datetime.now()
+            _cache["extract_count"] += 1
+            _cache["last_error"] = None
+        logger.info("✅ Manually updated cookies")
+        return jsonify({"success": True, "message": "Cookies updated manually"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ── Main ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
