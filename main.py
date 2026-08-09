@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Cookie Service — Render.com (Docker)
-Uses system Chromium + Playwright to extract YouTube cookies.
+Uses system Chromium + Playwright with robust fallbacks.
 """
 
 import os
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Config from environment ──────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────
 GOOGLE_EMAIL   = os.environ.get("GOOGLE_EMAIL", "")
 GOOGLE_PASS    = os.environ.get("GOOGLE_PASS", "")
 RENDER_SECRET  = os.environ.get("RENDER_SECRET", "")
@@ -30,7 +30,7 @@ COOKIE_MAX_AGE = int(os.environ.get("COOKIE_MAX_AGE", "72"))
 CHROMIUM_PATH  = os.environ.get("CHROMIUM_PATH", "/usr/bin/chromium")
 RETRY_COUNT    = int(os.environ.get("RETRY_COUNT", "3"))
 
-# ── In-memory cache with lock ────────────────────────────────────────────
+# ── In-memory cache ────────────────────────────────────────────────────
 _cache = {
     "cookie_text":   None,
     "extracted_at":  None,
@@ -40,16 +40,15 @@ _cache = {
 }
 _cache_lock = threading.Lock()
 
-# ── Auth ──────────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────
 def is_authorized():
     secret = request.headers.get("X-Render-Secret", "")
     return secret == RENDER_SECRET and RENDER_SECRET != ""
 
-# ── Core extraction (with retries) ──────────────────────────────────────
+# ── Core extraction with multiple strategies ─────────────────────────
 def extract_cookies():
-    """Extract cookies using system Chromium. Returns Netscape format string."""
+    """Extract cookies – tries multiple approaches with retries."""
     last_exception = None
-
     for attempt in range(1, RETRY_COUNT + 1):
         logger.info(f"Extraction attempt {attempt}/{RETRY_COUNT}")
         try:
@@ -57,13 +56,11 @@ def extract_cookies():
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed: {e}")
             last_exception = e
-            # Wait longer between attempts
-            time.sleep(5 * attempt)
-
+            time.sleep(5 * attempt)  # backoff
     raise Exception(f"All {RETRY_COUNT} attempts failed. Last error: {last_exception}")
 
 def _extract_cookies_internal():
-    """Internal extraction logic – one attempt."""
+    """Internal extraction – one attempt."""
     with sync_playwright() as p:
         logger.info("Launching Chromium...")
         browser = p.chromium.launch(
@@ -88,53 +85,107 @@ def _extract_cookies_internal():
         )
         page = context.new_page()
 
+        # Save debug artifacts on failure
+        def save_debug_info():
+            try:
+                page.screenshot(path="/tmp/debug_latest.png")
+                with open("/tmp/debug_latest.html", "w") as f:
+                    f.write(page.content())
+                logger.info("Saved debug screenshot and HTML to /tmp/")
+            except:
+                pass
+
         try:
-            # 1. Go to Google Accounts (more predictable)
-            logger.info("Navigating to accounts.google.com...")
-            page.goto("https://accounts.google.com/", wait_until="networkidle", timeout=30000)
+            # ── Strategy: Start from YouTube, click "Sign in" ──
+            logger.info("Navigating to YouTube...")
+            page.goto("https://www.youtube.com", wait_until="networkidle", timeout=30000)
+            # Wait for the sign-in button (could be text or a[href])
+            sign_in_clicked = False
+            for selector in ['text="Sign in"', 'a[href*="accounts.google.com"]', 'ytd-button-renderer:has-text("Sign in")']:
+                try:
+                    page.wait_for_selector(selector, state="visible", timeout=5000)
+                    page.click(selector)
+                    sign_in_clicked = True
+                    logger.info(f"Clicked sign-in using selector: {selector}")
+                    break
+                except:
+                    continue
+            if not sign_in_clicked:
+                # Fallback: go directly to accounts.google.com
+                logger.info("Sign-in button not found; going directly to accounts.google.com")
+                page.goto("https://accounts.google.com/", wait_until="networkidle", timeout=30000)
 
-            # 2. Fill email
+            # ── Wait for either email field or "Choose an account" ──
+            # Check for "Choose an account" screen
+            try:
+                choose_account = page.wait_for_selector('div[data-challengetype]', timeout=3000)  # not reliable
+                # better: check for text
+                if page.locator('text="Choose an account"').is_visible():
+                    logger.info("Detected 'Choose an account' screen.")
+                    # Click "Use another account" or the "Add account" button
+                    try:
+                        page.click('text="Use another account"')
+                    except:
+                        page.click('text="Add account"')
+                    # Wait for email field to appear
+                    page.wait_for_selector('#identifierId', state="visible", timeout=10000)
+            except:
+                # No choose account; proceed with email field
+                pass
+
+            # ── Enter email ──
             logger.info("Entering email...")
-            page.wait_for_selector('input[type="email"]', state="visible", timeout=10000)
-            page.fill('input[type="email"]', GOOGLE_EMAIL)
-            page.click('#identifierNext')
-            # Wait for password field to appear
-            page.wait_for_selector('input[type="password"]', state="visible", timeout=10000)
+            # Try multiple selectors for email input
+            email_selectors = ['#identifierId', 'input[type="email"]', 'input[name="identifier"]']
+            email_filled = False
+            for sel in email_selectors:
+                try:
+                    page.wait_for_selector(sel, state="visible", timeout=5000)
+                    page.fill(sel, GOOGLE_EMAIL)
+                    email_filled = True
+                    logger.info(f"Filled email using selector: {sel}")
+                    break
+                except:
+                    continue
+            if not email_filled:
+                save_debug_info()
+                raise Exception("Could not find email input field.")
 
-            # 3. Fill password
+            page.click('#identifierNext')
+            # Wait for password field
+            page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
+
+            # ── Enter password ──
             logger.info("Entering password...")
             page.fill('input[type="password"]', GOOGLE_PASS)
             page.click('#passwordNext')
 
-            # 4. Wait for login to complete – watch for redirect to YouTube or My Account
-            # Either we land on a page with YouTube logo, or we check the URL.
+            # ── Wait for successful login ──
             logger.info("Waiting for login to complete...")
             try:
-                # Wait for navigation to YouTube or any Google service
                 page.wait_for_url(lambda url: "youtube.com" in url or "myaccount.google.com" in url, timeout=15000)
             except PlaywrightTimeout:
-                # Possibly we are stuck on a challenge page – take a screenshot for debugging
-                page.screenshot(path="/tmp/login_fail.png")
-                raise Exception("Login did not navigate to YouTube or My Account. Possibly 2FA/CAPTCHA.")
+                # Maybe a CAPTCHA or 2FA page appears
+                save_debug_info()
+                raise Exception("Login did not navigate to expected URL – possible CAPTCHA or 2FA.")
 
-            # 5. Now navigate explicitly to YouTube to get the cookies
-            logger.info("Navigating to YouTube...")
-            page.goto("https://www.youtube.com", wait_until="networkidle", timeout=30000)
-            # Wait for the YouTube home page to show some content
+            # ── Ensure we're on YouTube ──
+            if "youtube.com" not in page.url:
+                logger.info("Navigating to YouTube...")
+                page.goto("https://www.youtube.com", wait_until="networkidle", timeout=30000)
             page.wait_for_selector('ytd-app', state="visible", timeout=10000)
 
-            # 6. Grab all cookies from the relevant domains
+            # ── Grab cookies ──
             logger.info("Grabbing cookies...")
             cookies = context.cookies([
                 "https://www.youtube.com",
                 "https://google.com",
                 "https://accounts.google.com",
             ])
-
             if not cookies:
-                raise Exception("No cookies found after login – likely login failed silently.")
+                raise Exception("No cookies found after login.")
 
-            # Convert to Netscape format (for yt-dlp)
+            # Convert to Netscape format
             lines = ["# Netscape HTTP Cookie File\n"]
             for c in cookies:
                 domain  = c["domain"]
@@ -145,47 +196,32 @@ def _extract_cookies_internal():
                 lines.append(
                     f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
                 )
-
             cookie_text = "".join(lines)
             logger.info(f"✅ Extracted {len(cookies)} cookies")
             return cookie_text
 
         except Exception as e:
-            # Save debug info
-            try:
-                page.screenshot(path="/tmp/debug_latest.png")
-                with open("/tmp/debug_latest.html", "w") as f:
-                    f.write(page.content())
-            except:
-                pass
+            save_debug_info()
             raise e
         finally:
             browser.close()
 
-# ── Cache wrapper (thread-safe, keeps old cookie on failure) ──────────
+# ── Cache wrapper (thread-safe) ──────────────────────────────────────
 def get_cookies():
-    """Return (cookie_text, is_fresh) – if cache is stale or missing, try refresh."""
+    """Return (cookie_text, is_fresh)."""
     with _cache_lock:
-        # If we have a valid cached cookie and it's not too old, return it.
         if _cache["cookie_text"] and _cache["extracted_at"]:
             age = datetime.now() - _cache["extracted_at"]
             if age < timedelta(hours=COOKIE_MAX_AGE):
                 logger.info(f"Using cached cookies (age: {age.total_seconds()/3600:.1f}h)")
                 return _cache["cookie_text"], False
 
-        # Otherwise, need to extract (or re-extract)
         if _cache["extracting"]:
-            # Another thread is already extracting; we could wait or return stale?
-            # For simplicity, wait a bit and then return whatever is in cache (maybe None)
-            logger.warning("Extraction already in progress – waiting...")
-            # We could implement a wait loop, but we'll raise a 503 to let client retry.
-            # Let's raise an exception that the caller can convert to a 503.
             raise Exception("Extraction already in progress; please retry later.")
 
         logger.info("Cache expired or missing – starting fresh extraction...")
         _cache["extracting"] = True
 
-    # Release the lock while we extract (so health checks can still read)
     try:
         new_text = extract_cookies()
         with _cache_lock:
@@ -199,11 +235,10 @@ def get_cookies():
         with _cache_lock:
             _cache["last_error"] = str(e)
             _cache["extracting"] = False
-            # Keep the old cookie if any; we don't clear it.
         logger.error(f"Extraction failed: {e}")
         raise
 
-# ── Flask Routes ─────────────────────────────────────────────────────────
+# ── Flask Routes ──────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def health():
@@ -225,7 +260,6 @@ def health():
 
 @app.route("/cookies", methods=["GET"])
 def serve_cookies():
-    """Return base64-encoded Netscape cookies."""
     if not is_authorized():
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -245,22 +279,18 @@ def serve_cookies():
             "extracted_at": extracted_at_str,
         }), 200
     except Exception as e:
-        # If the error is "extraction in progress", return 503
         if "already in progress" in str(e):
             return jsonify({"error": "Extraction in progress, please retry"}), 503
         return jsonify({"error": str(e)}), 500
 
 @app.route("/force-refresh", methods=["POST"])
 def force_refresh():
-    """Force re-extraction in background."""
     if not is_authorized():
         return jsonify({"error": "Unauthorized"}), 401
 
     with _cache_lock:
-        # Invalidate cache but keep old cookie until new one is ready
-        _cache["extracted_at"] = None  # this will trigger re-extraction on next GET
+        _cache["extracted_at"] = None  # invalidate
 
-    # Start a background thread to perform extraction immediately
     def _do_refresh():
         try:
             logger.info("Force refresh started in background")
@@ -272,7 +302,7 @@ def force_refresh():
     threading.Thread(target=_do_refresh, daemon=True).start()
     return jsonify({"message": "Refresh started – check / for status"}), 200
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
