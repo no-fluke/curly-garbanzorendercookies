@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Cookie Service — Render.com (Docker)
-- Extracts YouTube cookies via headless Chromium
-- Caches cookies in memory for 72 hours
-- Serves cookies to Heroku API on request
-- Protected by RENDER_SECRET header
+Uses system Chromium instead of Playwright's bundled browser.
 """
 
 import os
@@ -21,7 +18,10 @@ app = Flask(__name__)
 GOOGLE_EMAIL   = os.environ.get("GOOGLE_EMAIL",  "")
 GOOGLE_PASS    = os.environ.get("GOOGLE_PASS",   "")
 RENDER_SECRET  = os.environ.get("RENDER_SECRET", "")
-COOKIE_MAX_AGE = int(os.environ.get("COOKIE_MAX_AGE", "72"))  # hours
+COOKIE_MAX_AGE = int(os.environ.get("COOKIE_MAX_AGE", "72"))
+
+# System Chromium path (installed via apt in Dockerfile)
+CHROMIUM_PATH  = "/usr/bin/chromium"
 
 # ── In-memory cache ───────────────────────────────────────────────────────────
 _cache = {
@@ -38,17 +38,19 @@ def is_authorized():
     secret = request.headers.get("X-Render-Secret", "")
     return secret == RENDER_SECRET and RENDER_SECRET != ""
 
-# ── Extract cookies via headless Chromium ─────────────────────────────────────
+# ── Extract cookies via system Chromium ───────────────────────────────────────
 def extract_cookies():
-    print(f"[{datetime.now()}] Launching headless Chromium...")
+    print(f"[{datetime.now()}] Launching system Chromium...")
     with sync_playwright() as p:
         browser = p.chromium.launch(
+            executable_path=CHROMIUM_PATH,
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
             ]
         )
         context = browser.new_context(
@@ -145,7 +147,6 @@ def get_cookies():
 
 @app.route("/", methods=["GET"])
 def health():
-    """Public health check — no auth needed."""
     age_hrs = None
     if _cache["extracted_at"]:
         age_hrs = round(
@@ -164,11 +165,7 @@ def health():
 
 @app.route("/cookies", methods=["GET"])
 def serve_cookies():
-    """
-    Called by Heroku on every restart.
-    Requires header: X-Render-Secret: <RENDER_SECRET>
-    Returns base64 encoded cookies in Netscape format.
-    """
+    """Called by Heroku on every restart."""
     if not is_authorized():
         return jsonify({"error": "Unauthorized"}), 401
     try:
