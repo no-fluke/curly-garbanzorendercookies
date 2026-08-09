@@ -1,13 +1,12 @@
-# Use official Python image
-FROM python:3.11-slim
+# Use full Debian-based Python image (not slim) — required for Playwright
+FROM python:3.11-bookworm
 
-# Install system dependencies for Playwright + Chromium
+# Install Chromium dependencies manually (bypass playwright install-deps)
 RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    curl \
-    ca-certificates \
+    chromium \
+    chromium-driver \
     fonts-liberation \
+    fonts-unifont \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -26,10 +25,15 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
-    libu2f-udev \
-    libvulkan1 \
+    wget \
+    curl \
+    ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Tell Playwright to use system Chromium instead of downloading its own
+ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # Set working directory
 WORKDIR /app
@@ -38,14 +42,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright + Chromium browser
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Install only Playwright (no browser download — using system Chromium)
+RUN pip install playwright==1.44.0
 
 # Copy app code
 COPY main.py .
 
-# Expose port (Render uses 10000 by default for Docker)
+# Expose port
 EXPOSE 10000
 
 # Start app
